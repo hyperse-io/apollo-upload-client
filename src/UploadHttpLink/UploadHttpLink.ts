@@ -1,12 +1,13 @@
-import { HttpLink } from '@apollo/client';
 import { ApolloLink, defaultPrinter } from '@apollo/client';
+import { BaseHttpLink } from '@apollo/client/link/http';
 import { parseAndCheckHttpResponse } from '@apollo/client/link/http';
 import {
   fallbackHttpConfig,
   selectHttpOptionsAndBodyInternal,
 } from '@apollo/client/link/http';
 import { selectURI } from '@apollo/client/link/http';
-import { Observable } from '@apollo/client/utilities';
+import { filterOperationVariables } from '@apollo/client/link/utils';
+import { isSubscriptionOperation, Observable } from '@apollo/client/utilities';
 import { maybe } from '@apollo/client/utilities/internal/globals';
 import { extractFiles } from '../extractFiles/extractFiles.js';
 import {
@@ -14,22 +15,13 @@ import {
   isExtractableFile,
 } from '../extractFiles/isExtractableFile.js';
 import { formDataAppendFile } from './formDataAppendFile.js';
-
-// Helper function to serialize fetch parameters (replacement for serializeFetchParameter)
-function serializeFetchParameter(value: unknown, _type: string): string {
-  return JSON.stringify(value);
-}
-
-/**
- * Creates an AbortController with proper fallback for older environments.
- * This replaces the deprecated createSignalIfSupported function.
- */
-function createAbortController(): AbortController | null {
-  if (typeof AbortController !== 'undefined') {
-    return new AbortController();
-  }
-  return null;
-}
+import {
+  backupFetch,
+  compact,
+  createAbortController,
+  noop,
+  serializeFetchParameter,
+} from './utils.js';
 
 /**
  * Checks if a value is an extractable file.
@@ -52,24 +44,22 @@ export interface FormDataFileAppender<T> {
   (formData: FormData, fieldName: string, file: T): void;
 }
 
-const backupFetch = maybe(() => fetch);
-function noop() {}
-
 /**
  * Options for creating an upload link.
  */
-export interface UploadLinkOptions<T extends ExtractableFile>
-  extends HttpLink.Options {
-  /**
-   * Matches extractable files in the GraphQL operation.
-   * Defaults to {@linkcode isExtractableFile}.
-   */
-  isExtractableFile?: ExtractableFileMatcher<T>;
+export interface UploadHttpLinkOptions<
+  T extends ExtractableFile = ExtractableFile,
+> extends BaseHttpLink.Options {
   /**
    * [`FormData`](https://developer.mozilla.org/en-US/docs/Web/API/FormData) class.
    *  Defaults to the {@linkcode FormData} global.
    */
   FormData?: typeof FormData;
+  /**
+   * Matches extractable files in the GraphQL operation.
+   * Defaults to {@linkcode isExtractableFile}.
+   */
+  isExtractableFile?: ExtractableFileMatcher<T>;
   /**
    * Customizes how extracted files are appended to the [`FormData`](https://developer.mozilla.org/en-US/docs/Web/API/FormData) instance.
    * Defaults to {@linkcode formDataAppendFile}.
@@ -77,56 +67,91 @@ export interface UploadLinkOptions<T extends ExtractableFile>
   formDataAppendFile?: FormDataFileAppender<T>;
 }
 
-export class UploadLink<T extends ExtractableFile> extends ApolloLink {
-  private httpLink: HttpLink;
+/**
+ * Creates a
+ * [terminating Apollo Link](https://www.apollographql.com/docs/react/api/link/introduction/#the-terminating-link)
+ * for [Apollo Client](https://www.apollographql.com/docs/react) that fetches a
+ * [GraphQL multipart request](https://github.com/jaydenseric/graphql-multipart-request-spec)
+ * if the GraphQL variables contain files (by default
+ * [`FileList`](https://developer.mozilla.org/en-US/docs/Web/API/FileList),
+ * [`File`](https://developer.mozilla.org/en-US/docs/Web/API/File), or
+ * [`Blob`](https://developer.mozilla.org/en-US/docs/Web/API/Blob) instances),
+ * or else fetches a regular
+ * [GraphQL POST or GET request](https://www.apollographql.com/docs/apollo-server/workflow/requests)
+ * (depending on the config and GraphQL operation).
+ *
+ * Some of the options are similar to the
+ * [`createHttpLink` options](https://www.apollographql.com/docs/react/api/link/apollo-link-http/#httplink-constructor-options).
+ * @see [GraphQL multipart request spec](https://github.com/jaydenseric/graphql-multipart-request-spec).
+ * @example
+ * A basic Apollo Client setup:
+ *
+ * ```js
+ * import { ApolloClient, InMemoryCache } from "@apollo/client";
+ * import { UploadHttpLink } from '@hyperse/apollo-upload-client';
+ *
+ * const client = new ApolloClient({
+ *   cache: new InMemoryCache(),
+ *   link: ApolloLink.from([
+ *     new ClientAwarenessLink(options),
+ *     new UploadHttpLink(options),
+ *   ])
+ * });
+ * ```
+ */
+export class UploadHttpLink<
+  T extends ExtractableFile = ExtractableFile,
+> extends ApolloLink {
+  private baseHttpLink: BaseHttpLink;
 
-  constructor(options: UploadLinkOptions<T> = {}) {
+  constructor(options: UploadHttpLinkOptions<T> = {}) {
     super();
 
-    // 创建一个 HttpLink 实例用于处理无文件的情况
-    this.httpLink = new HttpLink(options);
+    // Create a BaseHttpLink instance for handling non-file requests
+    this.baseHttpLink = new BaseHttpLink(options);
 
     const {
-      uri: fetchUri = '/graphql',
+      uri = '/graphql',
+      fetch: preferredFetch,
+      print = defaultPrinter,
+      includeExtensions,
+      preserveHeaderCase,
+      includeUnusedVariables = false,
+      FormData: CustomFormData,
       isExtractableFile:
         customIsExtractableFile = isExtractableFile as ExtractableFileMatcher<T>,
-      FormData: CustomFormData,
       formDataAppendFile:
         customFormDataAppendFile = formDataAppendFile as FormDataFileAppender<T>,
-      print = defaultPrinter,
-      fetch: preferredFetch,
-      fetchOptions,
-      credentials,
-      headers,
-      includeExtensions,
+      ...requestOptions
     } = options;
 
     const linkConfig = {
-      http: { includeExtensions },
-      options: fetchOptions,
-      credentials,
-      headers,
+      http: compact({ includeExtensions, preserveHeaderCase }),
+      options: requestOptions.fetchOptions,
+      credentials: requestOptions.credentials,
+      headers: requestOptions.headers,
     };
 
-    // 重写 request 方法
+    // Override the request method
     this.request = (operation) => {
       const context = operation.getContext();
-      const {
-        clientAwareness: { name, version } = {},
-        headers: contextHeaders,
-      } = context;
+
+      const http = { ...context.http };
+      if (isSubscriptionOperation(operation.query)) {
+        http.accept = [
+          'multipart/mixed;boundary=graphql;subscriptionSpec=1.0',
+          ...(http.accept || []),
+        ];
+      }
 
       const contextConfig = {
-        http: context.http,
+        http,
         options: context.fetchOptions,
         credentials: context.credentials,
-        headers: {
-          ...(name && { 'apollographql-client-name': name }),
-          ...(version && { 'apollographql-client-version': version }),
-          ...contextHeaders,
-        },
+        headers: context.headers,
       };
 
+      //uses fallback, link, and then context to build options
       const { options, body } = selectHttpOptionsAndBodyInternal(
         operation,
         print,
@@ -135,6 +160,14 @@ export class UploadLink<T extends ExtractableFile> extends ApolloLink {
         contextConfig
       );
 
+      if (body.variables && !includeUnusedVariables) {
+        body.variables = filterOperationVariables(
+          body.variables,
+          operation.query
+        );
+      }
+
+      // Extract files from the body
       const { clone, files } = extractFiles(
         body,
         customIsExtractableFile as (value: unknown) => value is ExtractableFile,
@@ -143,12 +176,15 @@ export class UploadLink<T extends ExtractableFile> extends ApolloLink {
 
       // If there are no files, directly use HttpLink to handle
       if (!files.size) {
-        // HttpLink is a terminating link, the forward parameter will not be used
-        return this.httpLink.request(operation, () => new Observable(() => {}));
+        // No file need to upload, fallback to HttpLink
+        return this.baseHttpLink.request(
+          operation,
+          () => new Observable(() => {})
+        );
       }
 
       // When there are files, use the file upload logic
-      const uri = selectURI(operation, fetchUri);
+      const chosenURI = selectURI(operation, uri);
 
       // Automatically set content-type to multipart/form-data
       if (options.headers) {
@@ -189,6 +225,9 @@ export class UploadLink<T extends ExtractableFile> extends ApolloLink {
       if (controller) {
         if (options.signal) {
           const externalSignal: AbortSignal = options.signal;
+          // in an ideal world we could use `AbortSignal.any` here, but
+          // React Native uses https://github.com/mysticatea/abort-controller as
+          // a polyfill for `AbortController`, and it does not support `AbortSignal.any`.
           const listener = () => {
             controller?.abort(externalSignal.reason);
           };
@@ -196,9 +235,12 @@ export class UploadLink<T extends ExtractableFile> extends ApolloLink {
           cleanupController = () => {
             controller?.signal.removeEventListener('abort', cleanupController);
             controller = null;
+            // on cleanup, we need to stop listening to `options.signal` to avoid memory leaks
             externalSignal.removeEventListener('abort', listener);
             cleanupController = noop;
           };
+          // react native also does not support the addEventListener `signal` option
+          // so we have to simulate that ourself
           controller.signal.addEventListener('abort', cleanupController, {
             once: true,
           });
@@ -211,7 +253,7 @@ export class UploadLink<T extends ExtractableFile> extends ApolloLink {
         const runtimeFetch =
           preferredFetch || maybe(() => fetch) || backupFetch;
 
-        runtimeFetch!(uri, options)
+        runtimeFetch!(chosenURI, options)
           .then((response) => {
             // Forward the response on the context.
             operation.setContext({ response });

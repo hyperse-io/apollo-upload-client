@@ -1,2 +1,2 @@
-export * from './createUploadLink/index.js';
 export * from './extractFiles/index.js';
+export * from './UploadHttpLink/index.js';

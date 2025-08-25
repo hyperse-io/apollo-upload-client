@@ -30,11 +30,6 @@
       "types": "./dist/extractFiles/index.d.ts",
       "default": "./dist/extractFiles/index.js"
     },
-    "./createUploadLink": {
-      "import": "./dist/createUploadLink/index.js",
-      "types": "./dist/createUploadLink/index.d.ts",
-      "default": "./dist/createUploadLink/index.js"
-    },
     "./package.json": "./package.json"
   },
   "types": "./dist/index.d.ts",
